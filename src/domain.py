@@ -1,5 +1,6 @@
 """领域基础类型与输入校验。"""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 
@@ -95,3 +96,16 @@ def text_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[str]:
     if len(value) < minimum:
         raise ValidationError("%s至少需要%s项" % (key, minimum))
     return [item.strip() for item in value]
+
+
+def timestamp(data: Dict[str, Any], key: str) -> str:
+    """解析现场发生时刻，返回归一化的ISO8601 UTC文本，要求带时区。"""
+    value = text(data, key)
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValidationError("%s必须是ISO8601时间" % key) from exc
+    if parsed.tzinfo is None:
+        raise ValidationError("%s必须携带时区" % key)
+    return parsed.astimezone(timezone.utc).isoformat()

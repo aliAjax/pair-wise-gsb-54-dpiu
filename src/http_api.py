@@ -12,6 +12,9 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+RECORD_SPLICES_RE = re.compile(r"^/api/records/(\d+)/splices$")
+SPLICE_BACKFILL_RE = re.compile(r"^/api/records/(\d+)/splices/backfill$")
+SPLICE_ITEM_RE = re.compile(r"^/api/splices/(\d+)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -87,6 +90,21 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if parsed.path == "/api/splices":
+                    query = parse_qs(parsed.query)
+                    result = service.list_splices(
+                        self._actor(),
+                        cable=query.get("cable", [None])[0],
+                        segment=query.get("segment", [None])[0],
+                        status=query.get("status", [None])[0],
+                        limit=int(query.get("limit", ["500"])[0]),
+                    )
+                    self._send(200, result)
+                    return
+                match = SPLICE_ITEM_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_splice(self._actor(), int(match.group(1))))
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -107,6 +125,23 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
                     return
+                match = SPLICE_BACKFILL_RE.match(parsed.path)
+                if match:
+                    result = service.backfill(self._actor(), int(match.group(1)), body.get("data", {}))
+                    self._send(200, result)
+                    return
+                match = RECORD_SPLICES_RE.match(parsed.path)
+                if match:
+                    result = service.report_field_splice(self._actor(), int(match.group(1)), body.get("data", {}))
+                    self._send(202 if result["outcome"] == "pending" else 200, result)
+                    return
+                match = SPLICE_ITEM_RE.match(parsed.path)
+                if match:
+                    if body.get("action", "") == "resolve":
+                        result = service.resolve_pending_splice(self._actor(), int(match.group(1)), body.get("data", {}))
+                        self._send(200, result)
+                        return
+                    raise ValidationError("该路径仅支持action=resolve")
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
