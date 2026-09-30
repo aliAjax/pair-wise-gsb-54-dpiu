@@ -1,5 +1,6 @@
 """领域基础类型与输入校验。"""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 
@@ -95,3 +96,20 @@ def text_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[str]:
     if len(value) < minimum:
         raise ValidationError("%s至少需要%s项" % (key, minimum))
     return [item.strip() for item in value]
+
+
+def moment(data: Dict[str, Any], key: str) -> str:
+    """解析ISO 8601现场时刻，统一归一化为UTC。缺省时取服务当前时刻。"""
+    value = data.get(key)
+    if value is None:
+        return datetime.now(timezone.utc).isoformat()
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("%s必须是ISO 8601时间文本" % key)
+    text_value = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text_value)
+    except ValueError as exc:
+        raise ValidationError("%s必须是ISO 8601时间文本" % key) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()

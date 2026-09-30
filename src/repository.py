@@ -2,13 +2,163 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from types import TracebackType
+from typing import Any, Dict, List, Optional, Type
 
 from .domain import Conflict, NotFound
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class Transaction:
+    """以BEGIN IMMEDIATE持锁的工作单元，保证并发判定与写入原子。"""
+
+    def __init__(self, db_path: str) -> None:
+        self.connection = sqlite3.connect(db_path, timeout=15)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 15000")
+
+    def __enter__(self) -> "Transaction":
+        self.connection.execute("BEGIN IMMEDIATE")
+        return self
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException], tb: Optional[TracebackType]) -> None:
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+
+    def _row(self, row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+        if row is None:
+            raise NotFound("记录不存在")
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        return item
+
+    # -- records -------------------------------------------------------
+    def get_record(self, record_id: int) -> Dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        return self._row(row)
+
+    def list_segment_records(self, cable: str, segment: str) -> List[Dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM records ORDER BY id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            payload = json.loads(item["payload"])
+            if payload.get("cable") == cable and payload.get("segment") == segment:
+                item["payload"] = payload
+                result.append(item)
+        return result
+
+    def update_record(
+        self,
+        record: Dict[str, Any],
+        state: str,
+        payload: Dict[str, Any],
+        actor_id: str,
+        expected_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        current_version = int(record["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise Conflict("版本冲突，请刷新后重试")
+        version = current_version + 1
+        self.connection.execute(
+            "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+            (state, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, _now(), record["id"]),
+        )
+        return self.get_record(record["id"])
+
+    # -- splice entries ------------------------------------------------
+    def insert_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO splice_entries(cable,segment,occurred_at,splice_loss_db,spare_used_km,status,"
+                "record_id,report_id,idempotency_key,engineer_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    entry["cable"],
+                    entry["segment"],
+                    entry["occurred_at"],
+                    float(entry["splice_loss_db"]),
+                    entry.get("spare_used_km"),
+                    entry["status"],
+                    entry.get("record_id"),
+                    entry.get("report_id"),
+                    entry.get("idempotency_key"),
+                    entry["engineer_id"],
+                    entry.get("note", ""),
+                    _now(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("接续上报重复，请核对report_id/幂等键后重试") from exc
+        return self.get_entry(int(cursor.lastrowid))
+
+    def get_entry(self, entry_id: int) -> Dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM splice_entries WHERE id=?", (entry_id,)).fetchone()
+        if row is None:
+            raise NotFound("接续条目不存在")
+        return dict(row)
+
+    def find_entry_by_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        row = self.connection.execute("SELECT * FROM splice_entries WHERE report_id=?", (report_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_entry_by_idempotency(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        row = self.connection.execute("SELECT * FROM splice_entries WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_segment_event(self, cable: str, segment: str, occurred_at: str) -> List[Dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM splice_entries WHERE cable=? AND segment=? AND occurred_at=? ORDER BY id",
+            (cable, segment, occurred_at),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def segment_entries(self, cable: str, segment: str) -> List[Dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM splice_entries WHERE cable=? AND segment=? ORDER BY occurred_at, id",
+            (cable, segment),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def confirm_entry(self, entry_id: int) -> Dict[str, Any]:
+        self.connection.execute("UPDATE splice_entries SET status='confirmed' WHERE id=?", (entry_id,))
+        return self.get_entry(entry_id)
+
+    def resolve_entry(self, entry_id: int, status: str) -> Dict[str, Any]:
+        self.connection.execute("UPDATE splice_entries SET status=? WHERE id=?", (status, entry_id))
+        return self.get_entry(entry_id)
+
+    def bind_entry(self, entry_id: int, record_id: int) -> None:
+        self.connection.execute("UPDATE splice_entries SET record_id=? WHERE id=?", (record_id, entry_id))
+
+    # -- audit ---------------------------------------------------------
+    def add_audit(self, record_id: int, action: str, actor_id: str, version: int, details: Dict[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+            (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
+        )
+
+    # -- helpers -------------------------------------------------------
+    def archive_snapshot(self, cable: str, segment: str) -> Dict[str, Any]:
+        entries = self.segment_entries(cable, segment)
+        confirmed = [entry for entry in entries if entry["status"] == "confirmed"]
+        total = round(sum(float(entry["splice_loss_db"]) for entry in confirmed), 6)
+        return {
+            "cable": cable,
+            "segment": segment,
+            "confirmed_count": len(confirmed),
+            "total_loss_db": total,
+            "last_entry_id": int(confirmed[-1]["id"]) if confirmed else 0,
+            "entries": entries,
+        }
 
 
 class Repository:
@@ -22,6 +172,9 @@ class Repository:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 15000")
         return connection
+
+    def transaction(self) -> Transaction:
+        return Transaction(self.db_path)
 
     def _init_schema(self) -> None:
         with self._connect() as connection:
@@ -38,6 +191,21 @@ class Repository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS splice_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cable TEXT NOT NULL,
+                    segment TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    splice_loss_db REAL NOT NULL,
+                    spare_used_km REAL,
+                    status TEXT NOT NULL DEFAULT 'confirmed',
+                    record_id INTEGER REFERENCES records(id) ON DELETE SET NULL,
+                    report_id TEXT,
+                    idempotency_key TEXT,
+                    engineer_id TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
@@ -49,6 +217,10 @@ class Repository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_splice_segment ON splice_entries(cable, segment, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_splice_status ON splice_entries(cable, segment, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_report ON splice_entries(report_id) WHERE report_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_splice_idem ON splice_entries(idempotency_key) WHERE idempotency_key IS NOT NULL;
                 """
             )
 
@@ -136,6 +308,30 @@ class Repository:
             item["details"] = json.loads(item["details"])
             result.append(item)
         return result
+
+    def get_entry(self, entry_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM splice_entries WHERE id=?", (entry_id,)).fetchone()
+        if row is None:
+            raise NotFound("接续条目不存在")
+        return dict(row)
+
+    def segment_archive(self, cable: str, segment: str) -> Dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM splice_entries WHERE cable=? AND segment=? ORDER BY occurred_at, id",
+                (cable, segment),
+            ).fetchall()
+        entries = [dict(row) for row in rows]
+        confirmed = [entry for entry in entries if entry["status"] == "confirmed"]
+        return {
+            "cable": cable,
+            "segment": segment,
+            "confirmed_count": len(confirmed),
+            "total_loss_db": round(sum(float(entry["splice_loss_db"]) for entry in confirmed), 6),
+            "last_entry_id": int(confirmed[-1]["id"]) if confirmed else 0,
+            "entries": entries,
+        }
 
     def stats(self) -> Dict[str, int]:
         with self._connect() as connection:

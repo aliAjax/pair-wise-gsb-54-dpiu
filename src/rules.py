@@ -1,17 +1,24 @@
 """跨海光缆故障与抢修协调领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Conflict, ValidationError, boolean, integer, moment, number, text
 
 
 INITIAL_STATE = "detected"
+RECTIFICATION_STATE = "rectification"
+DEFAULT_SPLICE_BUDGET_DB = 0.5
+SINGLE_SPLICE_LIMIT_DB = 0.2
+TEST_LOSS_LIMIT_DB = 0.5
 CREATE_ROLES = {'noc_operator'}
-ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
-TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'backfill': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
+TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced', 'rectification': 'spliced'}, 'backfill': {'spliced': 'spliced', 'tested': 'tested'}, 'test': {'spliced': 'tested', 'tested': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled', 'rectification': 'cancelled'}}
 
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
+    RECTIFICATION_STATE = RECTIFICATION_STATE
+    DEFAULT_SPLICE_BUDGET_DB = DEFAULT_SPLICE_BUDGET_DB
+    SINGLE_SPLICE_LIMIT_DB = SINGLE_SPLICE_LIMIT_DB
 
     def known_role(self, role: str) -> bool:
         all_roles = set(CREATE_ROLES)
@@ -37,6 +44,7 @@ class DomainRules:
         number(p, "spare_length_km", 0)
         boolean(p, "permit_valid")
         integer(p, "capacity_gbps", 1)
+        p["splice_loss_budget_db"] = number(p, "splice_loss_budget_db", 0) if "splice_loss_budget_db" in p and p["splice_loss_budget_db"] is not None else DEFAULT_SPLICE_BUDGET_DB
         if end <= start:
             raise ValidationError("结束里程必须大于开始里程")
         return p
@@ -64,6 +72,9 @@ class DomainRules:
         return allowed
 
     def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        """无需接续档案上下文的动作（approve/mobilize/survey/cancel）。"""
+        if action in {"splice", "backfill", "test", "restore"}:
+            raise Conflict("%s必须通过接续档案用例执行" % action)
         new_state = self.require_transition(record, action)
         data = dict(data or {})
         p = dict(record["payload"])
@@ -90,30 +101,137 @@ class DomainRules:
                 raise ValidationError("故障点不在申报区段")
             changes["fault_location_km"] = fault_km
             summary = "故障点勘察完成"
-        elif action == "splice":
-            loss = number(data, "splice_loss_db", 0)
-            if loss > 0.2:
-                raise ValidationError("接续损耗超过阈值")
-            if float(data.get("spare_used_km", 0)) < float(p["repair_distance_km"]):
-                raise ValidationError("备缆使用长度不足")
-            changes["splice_loss_db"] = loss
-            changes["spare_used_km"] = float(data["spare_used_km"])
-            summary = "光缆接续完成"
-        elif action == "test":
-            end_loss = number(data, "end_to_end_loss_db", 0)
-            if end_loss > 0.5:
-                raise ValidationError("端到端损耗不合格")
-            changes["end_to_end_loss_db"] = end_loss
-            changes["test_passed"] = True
-            summary = "系统测试通过"
-        elif action == "restore":
-            if not boolean(data, "traffic_restored"):
-                raise ValidationError("业务流量尚未恢复")
-            changes["traffic_restored"] = True
-            changes["restore_capacity_gbps"] = integer(data, "restore_capacity_gbps", 1)
-            summary = "通信恢复"
         elif action == "cancel":
             changes["cancel_reason"] = text(data, "cancel_reason")
             summary = "抢修取消"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    # ------------------------------------------------------------------
+    # 接续档案相关规则
+    # ------------------------------------------------------------------
+    def prepare_splice_report(self, data: Dict[str, Any], engineer_id: str) -> Dict[str, Any]:
+        """把现场上报整理为接续条目，单条阈值在此拦截。"""
+        d = dict(data or {})
+        loss = number(d, "splice_loss_db", 0)
+        if loss > SINGLE_SPLICE_LIMIT_DB:
+            raise ValidationError("接续损耗超过阈值")
+        raw_engineer = d.get("engineer_id")
+        engineer_id = raw_engineer.strip() if isinstance(raw_engineer, str) and raw_engineer.strip() else engineer_id
+        item = {
+            "occurred_at": moment(d, "occurred_at"),
+            "splice_loss_db": loss,
+            "engineer_id": engineer_id,
+            "report_id": d.get("report_id").strip() if isinstance(d.get("report_id"), str) and d.get("report_id").strip() else None,
+            "idempotency_key": d.get("idempotency_key").strip() if isinstance(d.get("idempotency_key"), str) and d.get("idempotency_key").strip() else None,
+            "note": d.get("note").strip() if isinstance(d.get("note"), str) else "",
+        }
+        if "spare_used_km" in d and d["spare_used_km"] is not None:
+            item["spare_used_km"] = number(d, "spare_used_km", 0)
+        return item
+
+    def accept_splice(self, record: Dict[str, Any], entry: Dict[str, Any], archive: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str, float]:
+        """接续确认入库后调用：按最新档案累计损耗判定工单走向。"""
+        new_state = self.require_transition(record, "splice")
+        p = dict(record["payload"])
+        budget = float(p.get("splice_loss_budget_db", DEFAULT_SPLICE_BUDGET_DB))
+        total = round(float(archive["total_loss_db"]), 6)
+        changes: Dict[str, Any] = {
+            "splice_loss_db": float(entry["splice_loss_db"]),
+            "segment_splice_count": int(archive["confirmed_count"]),
+            "segment_total_splice_loss_db": total,
+            "splice_budget_db": budget,
+        }
+        if entry.get("spare_used_km") is not None:
+            if float(entry["spare_used_km"]) < float(p["repair_distance_km"]):
+                raise ValidationError("备缆使用长度不足")
+            changes["spare_used_km"] = float(entry["spare_used_km"])
+        p.update(changes)
+        # 重新接续后原测试结果自然失效，清除测试标记
+        for stale_key in ("end_to_end_loss_db", "test_passed", "archive_seq_at_test"):
+            p.pop(stale_key, None)
+        if total > budget:
+            return RECTIFICATION_STATE, p, "接续已归档，区段累计损耗%s超过预算%s，退回待整改" % (total, budget), total
+        return new_state, p, "光缆接续完成，区段累计损耗%s" % total, total
+
+    def prepare_backfill_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        d = dict(data or {})
+        raw_items = d.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValidationError("items必须是非空历史接续列表")
+        items: List[Dict[str, Any]] = []
+        seen_times = set()
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise ValidationError("items中每一项必须是对象")
+            item = {
+                "occurred_at": moment(raw, "occurred_at"),
+                "splice_loss_db": number(raw, "splice_loss_db", 0),
+                "engineer_id": text(raw, "engineer_id") if raw.get("engineer_id") else "backfill",
+                "report_id": raw.get("report_id").strip() if isinstance(raw.get("report_id"), str) and raw.get("report_id").strip() else None,
+                "note": raw.get("note").strip() if isinstance(raw.get("note"), str) else "历史项补录",
+            }
+            if item["occurred_at"] in seen_times:
+                raise ValidationError("补录历史项的现场时刻不能重复")
+            seen_times.add(item["occurred_at"])
+            items.append(item)
+        return items
+
+    def after_backfill(self, record: Dict[str, Any], archive: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str, float]:
+        """补录历史项后按最新档案复核工单。"""
+        p = dict(record["payload"])
+        budget = float(p.get("splice_loss_budget_db", DEFAULT_SPLICE_BUDGET_DB))
+        total = round(float(archive["total_loss_db"]), 6)
+        changes: Dict[str, Any] = {
+            "segment_splice_count": int(archive["confirmed_count"]),
+            "segment_total_splice_loss_db": total,
+            "splice_budget_db": budget,
+        }
+        p.update(changes)
+        p.pop("archive_seq_at_test", None)
+        if total > budget:
+            p.pop("test_passed", None)
+            return RECTIFICATION_STATE, p, "历史项补齐后累计损耗%s超过预算%s，退回待整改" % (total, budget), total
+        if record["state"] == "tested":
+            p.pop("test_passed", None)
+            return "tested", p, "历史项已补齐，档案发生变化，恢复流量前需复测", total
+        return "spliced", p, "历史接续项已补齐", total
+
+    def apply_test(self, record: Dict[str, Any], data: Dict[str, Any], archive: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        new_state = self.require_transition(record, "test")
+        if int(archive["confirmed_count"]) <= 0:
+            raise Conflict("旧单缺少接续记录，请先通过backfill补齐历史项")
+        end_loss = number(data, "end_to_end_loss_db", 0)
+        if end_loss > TEST_LOSS_LIMIT_DB:
+            raise ValidationError("端到端损耗不合格")
+        p = dict(record["payload"])
+        p["end_to_end_loss_db"] = end_loss
+        p["test_passed"] = True
+        p["segment_total_splice_loss_db"] = round(float(archive["total_loss_db"]), 6)
+        p["archive_seq_at_test"] = int(archive["last_entry_id"])
+        if record["state"] == "tested":
+            summary = "已按最新接续档案复测通过"
+        else:
+            summary = "系统测试通过"
+        return new_state, p, summary
+
+    def apply_restore(self, record: Dict[str, Any], data: Dict[str, Any], archive: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        new_state = self.require_transition(record, "restore")
+        if int(archive["confirmed_count"]) <= 0:
+            raise Conflict("旧单缺少接续记录，请先通过backfill补齐历史项")
+        if not record["payload"].get("test_passed"):
+            raise Conflict("尚未完成系统测试")
+        if int(record["payload"].get("archive_seq_at_test", 0) or 0) != int(archive["last_entry_id"]):
+            raise Conflict("接续档案在测试后有更新（晚到记录），请先复测再恢复流量")
+        budget = float(record["payload"].get("splice_loss_budget_db", DEFAULT_SPLICE_BUDGET_DB))
+        total = round(float(archive["total_loss_db"]), 6)
+        if total > budget:
+            raise Conflict("区段累计损耗%s超过预算%s，不得恢复流量" % (total, budget))
+        d = dict(data or {})
+        if not boolean(d, "traffic_restored"):
+            raise ValidationError("业务流量尚未恢复")
+        p = dict(record["payload"])
+        p["traffic_restored"] = True
+        p["restore_capacity_gbps"] = integer(d, "restore_capacity_gbps", 1)
+        p["segment_total_splice_loss_db"] = total
+        return new_state, p, "通信恢复，已按最新接续档案复核"

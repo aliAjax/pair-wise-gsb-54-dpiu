@@ -17,17 +17,27 @@
   <h1>跨海光缆故障与抢修协调</h1>
   <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
   <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+  <div class="row" style="margin-top:1rem;">
+    <input id="cable" placeholder="光缆，如 SEA-1" value="SEA-1" style="padding:.4rem;">
+    <input id="segment" placeholder="区段，如 S3" value="S3" style="padding:.4rem;">
+    <button id="archive">查询区段接续档案</button>
+  </div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
 const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
+async function show(path, options) {
+  const response = await fetch(path, Object.assign({headers}, options || {}));
   const data = await response.json();
   document.getElementById("output").textContent = JSON.stringify(data, null, 2);
 }
 document.getElementById("load").onclick = () => show("/api/records?limit=20");
 document.getElementById("stats").onclick = () => show("/api/stats");
+document.getElementById("archive").onclick = () => {
+  const cable = encodeURIComponent(document.getElementById("cable").value.trim());
+  const segment = encodeURIComponent(document.getElementById("segment").value.trim());
+  show(`/api/cables/${cable}/segments/${segment}/splice-archive`);
+};
 </script>
 </body>
 </html>
